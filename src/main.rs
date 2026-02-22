@@ -58,7 +58,7 @@ mod utils {
 mod config;
 
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = "0.9.001 dev";
 
 struct FecGroup {
     parity: Option<Bytes>,
@@ -322,33 +322,6 @@ async fn main() -> Result<()> {
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
             info!("[Server Stats] Tx: {} B | Rx: {} B | Errors: {}", 
                 t_tx.load(Ordering::Relaxed), t_rx.load(Ordering::Relaxed), t_err.load(Ordering::Relaxed));
-        }
-    });
-
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(86400)).await;
-            
-            if let Ok(mut entries) = tokio::fs::read_dir(".").await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    
-                    if name.starts_with("server") && name.ends_with(".log") {
-                        if let Ok(metadata) = entry.metadata().await {
-                            if let Ok(modified) = metadata.modified() {
-                                if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
-                                    if age.as_secs() > 7 * 86400 {
-                                        if tokio::fs::remove_file(&path).await.is_ok() {
-                                            info!("Автоочистка: удален старый лог {}", name);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
         }
     });
 
