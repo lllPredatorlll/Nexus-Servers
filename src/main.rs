@@ -21,7 +21,7 @@ mod utils;
 mod config;
 
 
-const VERSION: &str = "0.9.001 dev";
+const VERSION: &str = "0.9.003 dev";
 
 struct FecGroup {
     parity: Option<Bytes>,
