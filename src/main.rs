@@ -17,44 +17,7 @@ use serde::{Serialize, Deserialize};
 use socket2::{Socket, Domain, Type, Protocol};
 use bytes::{Bytes, BytesMut, BufMut};
 
-mod utils {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    // SIMD-оптимизированная функция XOR (AVX2)
-    pub fn xor_bytes(dst: &mut [u8], src: &[u8]) {
-        let len = std::cmp::min(dst.len(), src.len());
-        let mut i = 0;
-
-        #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("avx2") {
-            unsafe {
-                while i + 32 <= len {
-                    let d_ptr = dst.as_mut_ptr().add(i) as *mut __m256i;
-                    let s_ptr = src.as_ptr().add(i) as *const __m256i;
-                    // Используем unaligned load/store для безопасности
-                    let d_val = _mm256_loadu_si256(d_ptr);
-                    let s_val = _mm256_loadu_si256(s_ptr);
-                    let res = _mm256_xor_si256(d_val, s_val);
-                    _mm256_storeu_si256(d_ptr, res);
-                    i += 32;
-                }
-            }
-        }
-
-        while i + 8 <= len {
-            let d_chunk = u64::from_ne_bytes(dst[i..i+8].try_into().unwrap());
-            let s_chunk = u64::from_ne_bytes(src[i..i+8].try_into().unwrap());
-            let res = d_chunk ^ s_chunk;
-            dst[i..i+8].copy_from_slice(&res.to_ne_bytes());
-            i += 8;
-        }
-
-        for j in i..len {
-            dst[j] ^= src[j];
-        }
-    }
-}
+mod utils;
 mod config;
 
 
@@ -82,8 +45,6 @@ impl FecReconstructor {
 
     fn on_packet(&mut self, seq: u32, data: Bytes) -> Option<Vec<u8>> {
         self.cleanup();
-        // Определяем ID группы (выравнивание по 20, так как k=20)
-        // Формула для 1-based seq: ((seq - 1) / 20) * 20 + 1
         let group_seq = if seq > 0 { ((seq - 1) / 20) * 20 + 1 } else { 0 };
         
         let group = self.active_groups.entry(group_seq).or_insert_with(|| FecGroup { 
@@ -116,7 +77,7 @@ impl FecReconstructor {
     fn try_recover(&mut self, group_seq: u32) -> Option<Vec<u8>> {
         let group = self.active_groups.get_mut(&group_seq)?;
         let k = 20;
-        if group.received_count == k { self.active_groups.remove(&group_seq); return None; } // Все пакеты на месте
+        if group.received_count == k { self.active_groups.remove(&group_seq); return None; }
 
         if group.received_count == k - 1 && group.parity.is_some() {
             let mut recovered = group.parity.as_ref().unwrap().to_vec();
@@ -126,7 +87,6 @@ impl FecReconstructor {
                 recovered[0] ^= len_bytes[0]; recovered[1] ^= len_bytes[1];
                 if recovered.len() < 2 + pkt.len() { recovered.resize(2 + pkt.len(), 0); }
                 
-                // SIMD оптимизация
                 crate::utils::xor_bytes(&mut recovered[2..2+pkt.len()], pkt);
             }
             if recovered.len() < 2 { return None; }
@@ -138,7 +98,6 @@ impl FecReconstructor {
 
     fn cleanup(&mut self) {
         let now = std::time::Instant::now();
-        // Запускаем очистку не чаще раза в 1 секунду
         if now.duration_since(self.last_cleanup).as_secs() >= 1 {
             self.active_groups.retain(|_, group| now.duration_since(group.created_at).as_secs() < 2);
             self.last_cleanup = now;
@@ -163,7 +122,6 @@ impl ShardedFecReconstructor {
     }
 
     fn on_packet(&self, seq: u32, data: Bytes) -> Option<Vec<u8>> {
-        // Распределяем нагрузку по шардам на основе номера группы пакетов
         let group_idx = if seq > 0 { (seq - 1) / 20 } else { 0 };
         let idx = (group_idx as usize) & self.mask;
         self.shards[idx].lock().unwrap().on_packet(seq, data)
@@ -257,8 +215,8 @@ async fn main() -> Result<()> {
         let _ = socket.set_only_v6(false);
     }
     
-    let _ = socket.set_recv_buffer_size(8 * 1024 * 1024); // 8MB
-    let _ = socket.set_send_buffer_size(8 * 1024 * 1024); // 8MB
+    let _ = socket.set_recv_buffer_size(8 * 1024 * 1024);
+    let _ = socket.set_send_buffer_size(8 * 1024 * 1024);
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     
@@ -371,12 +329,10 @@ async fn main() -> Result<()> {
     let udp_client_stats = client_stats.clone();
     let obf_key: Arc<Vec<u8>> = Arc::new(udp_config.security.psk.as_bytes().iter().cycle().take(4096).cloned().collect());
 
-    // Worker Pool для UDP (Прием и Дешифровка)
     let num_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let (_udp_tx_dispatch, _) = tokio::sync::broadcast::channel::<()>(1); // Dummy channel for signal if needed
+    let (_udp_tx_dispatch, _) = tokio::sync::broadcast::channel::<()>(1);
 
     tokio::spawn(async move {
-        // Канал для распределения пакетов по воркерам
         let (tx_pkt, rx_pkt) = async_channel::bounded::<(BytesMut, SocketAddr)>(16384);
 
         let psk = udp_config.security.psk.as_bytes();
@@ -389,7 +345,6 @@ async fn main() -> Result<()> {
         };
         let auth_token = udp_config.security.auth_token.as_bytes();
 
-        // Запускаем N воркеров
         for _ in 0..num_workers {
             let rx_pkt = rx_pkt.clone();
             let peers_recv = peers_recv.clone();
@@ -403,14 +358,14 @@ async fn main() -> Result<()> {
             let udp_client_stats = udp_client_stats.clone();
             let next_ip_udp = next_ip_udp.clone();
             let handshake_cipher = handshake_cipher_base.clone();
-            let auth_token = auth_token.to_vec(); // Clone for worker
+            let auth_token = auth_token.to_vec();
             let obf_key = obf_key.clone();
 
             tokio::spawn(async move {
                 let mut rng = StdRng::from_entropy();
                 while let Ok((mut buf, addr)) = rx_pkt.recv().await {
                     let len = buf.len();
-                    utils::xor_bytes(&mut buf, &obf_key); // De-obfuscate
+                    utils::xor_bytes(&mut buf, &obf_key);
                     udp_rx_metric.fetch_add(len as u64, Ordering::Relaxed);
                     if len < 28 { continue; }
 
@@ -448,10 +403,9 @@ async fn main() -> Result<()> {
                         if cipher.decrypt_in_place_detached(nonce, &[], &mut buf[12..12+data_len], tag).is_ok() {
                             let pad_len = buf[12] as usize;
                             
-                            // Обработка FEC (254)
                             if pad_len == 254 {
                                 if let Some(fec_lock) = peer_fec {
-                                    if data_len > 5 { // 1 (pad) + 4 (seq)
+                                    if data_len > 5 {
                                         let mut seq_bytes = [0u8; 4];
                                         seq_bytes.copy_from_slice(&buf[13..17]);
                                         let group_seq = u32::from_be_bytes(seq_bytes);
@@ -468,17 +422,15 @@ async fn main() -> Result<()> {
                                 continue; 
                             }
 
-                            if data_len > 1 + 4 + pad_len { // 1 (pad) + 4 (seq) + data
+                            if data_len > 1 + 4 + pad_len {
                                 let mut seq_bytes = [0u8; 4];
                                 seq_bytes.copy_from_slice(&buf[13..17]);
                                 let seq = u32::from_be_bytes(seq_bytes);
                                 let data = &buf[17 .. 12 + data_len - pad_len];
                                 let data_bytes = Bytes::copy_from_slice(data);
                                 
-                                // Отправляем в TUN
                                 let _ = tun_tx_udp.send(data_bytes.clone()).await;
                                 
-                                // Отправляем в FEC реконструктор
                                 if let Some(fec_lock) = peer_fec {
                                     let recovered_opt = fec_lock.on_packet(seq, data_bytes);
                                     if let Some(recovered) = recovered_opt {
@@ -591,7 +543,7 @@ async fn main() -> Result<()> {
 
                                 if let Ok(tag) = cipher_sender.encrypt_in_place_detached(nonce, &[], &mut final_pkt[12..]) {
                                     final_pkt.put_slice(tag.as_slice());
-                                    utils::xor_bytes(&mut final_pkt, &obf_key_sender); // Obfuscate
+                                    utils::xor_bytes(&mut final_pkt, &obf_key_sender);
                                     if socket_sender.send_to(&final_pkt, addr).await.is_ok() {
                                         tx_metric.fetch_add(final_pkt.len() as u64, Ordering::Relaxed);
                                         if let Some(tx) = &tx_stats_inner {
@@ -641,7 +593,7 @@ async fn main() -> Result<()> {
                             let mut packet = Vec::with_capacity(12 + encrypted.len());
                             packet.extend_from_slice(&nonce_bytes);
                             packet.extend_from_slice(&encrypted);
-                            utils::xor_bytes(&mut packet, &obf_key); // Obfuscate handshake response
+                            utils::xor_bytes(&mut packet, &obf_key);
                             if socket_recv.send_to(&packet, addr).await.is_ok() {
                                 udp_tx_metric.fetch_add(packet.len() as u64, Ordering::Relaxed);
                             }
@@ -668,13 +620,12 @@ async fn main() -> Result<()> {
 
                                 if let Ok(tag) = cipher.encrypt_in_place_detached(nonce, &[], &mut final_pkt[12..]) {
                                     final_pkt.extend_from_slice(tag.as_slice());
-                                    utils::xor_bytes(&mut final_pkt, &obf_key); // Obfuscate keepalive
+                                    utils::xor_bytes(&mut final_pkt, &obf_key);
                                     let _ = socket_udp_send.send_to(&final_pkt, addr).await;
                                 }
                             }
                             continue; 
                         }
-                        // Для TCP/Handshake seq нет, пропускаем 1 байт pad_len
                         let data = &decrypted_data[1..decrypted_data.len() - pad_len]; 
 
                         {
@@ -685,13 +636,11 @@ async fn main() -> Result<()> {
             });
         }
 
-        // Главный цикл приема UDP (Dispatcher)
-        let mut buf = BytesMut::with_capacity(65536);
+        let mut buf = vec![0u8; 65536];
         loop {
-            if buf.capacity() < 65536 { buf.reserve(65536); }
-            match socket_recv.recv_buf_from(&mut buf).await {
+            match socket_recv.recv_from(&mut buf).await {
                 Ok((len, addr)) => {
-                    let packet = buf.split_to(len);
+                    let packet = BytesMut::from(&buf[..len]);
                     if tx_pkt.send((packet, addr)).await.is_err() { break; }
                 },
                 Err(e) => {
@@ -746,18 +695,14 @@ async fn main() -> Result<()> {
                 let mut first_byte = [0u8; 1];
                 if stream.read_exact(&mut first_byte).await.is_err() { return; }
 
-                // Enforce TLS Mimicry (XTLS-Reality style)
-                // Если первый байт не 0x16 (TLS Handshake), сбрасываем соединение.
                 if first_byte[0] != 0x16 { return; }
 
-                // TLS Handshake Mimicry
                 let mut header = [0u8; 4];
                 if stream.read_exact(&mut header).await.is_err() { return; }
                 let ch_len = u16::from_be_bytes([header[2], header[3]]) as usize;
                 let mut ch_buf = vec![0u8; ch_len];
                 if stream.read_exact(&mut ch_buf).await.is_err() { return; }
 
-                // Send Server Hello + CCS + Fake Finished
                 let mut rng = StdRng::from_entropy();
                 let mut rand_bytes = [0u8; 32];
                 rng.fill_bytes(&mut rand_bytes);
@@ -765,13 +710,13 @@ async fn main() -> Result<()> {
                 rng.fill_bytes(&mut session_id);
 
                 let mut sh_payload = Vec::new();
-                sh_payload.extend_from_slice(&[0x03, 0x03]); // Version
+                sh_payload.extend_from_slice(&[0x03, 0x03]);
                 sh_payload.extend_from_slice(&rand_bytes);
                 sh_payload.push(32);
                 sh_payload.extend_from_slice(&session_id);
-                sh_payload.extend_from_slice(&[0x13, 0x01]); // Cipher
-                sh_payload.push(0x00); // Compression
-                sh_payload.extend_from_slice(&[0x00, 0x00]); // Extensions
+                sh_payload.extend_from_slice(&[0x13, 0x01]);
+                sh_payload.push(0x00);
+                sh_payload.extend_from_slice(&[0x00, 0x00]);
 
                 let mut sh_record = Vec::new();
                 sh_record.push(0x16);
@@ -791,21 +736,17 @@ async fn main() -> Result<()> {
                 stream.write_all(&ccs).await.ok();
                 stream.write_all(&fake_fin).await.ok();
 
-                // Read Client CCS + Finished (consume loosely)
                 let mut buf = [0u8; 1024];
                 let mut hdr = [0u8; 5];
-                // Expect CCS
                 if stream.read_exact(&mut hdr).await.is_ok() && hdr[0] == 0x14 {
                     let l = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
                     if l <= buf.len() { stream.read_exact(&mut buf[..l]).await.ok(); }
-                    // Expect Finished
                     if stream.read_exact(&mut hdr).await.is_ok() && hdr[0] == 0x17 {
                         let l = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
                         if l <= buf.len() { stream.read_exact(&mut buf[..l]).await.ok(); }
                     }
                 }
 
-                // Read actual first packet (wrapped in TLS App Data)
                 if stream.read_exact(&mut hdr).await.is_err() { return; }
                 if hdr[0] != 0x17 { return; }
                 let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
@@ -981,15 +922,10 @@ async fn main() -> Result<()> {
                     if let Ok(plaintext) = cipher_dec.decrypt(nonce, &buf[12..]) {
                         if plaintext.is_empty() { continue; }
                         let pad_len = plaintext[0] as usize;
-                        // TCP не использует Seq и FEC, формат: [PadLen][Data]
-                        if plaintext.len() <= 1 + 4 + pad_len { // Учитываем, что клиент теперь шлет Seq везде
-                            // Если это TCP, клиент шлет [Seq] и тут?
-                            // Да, vpn_client.rs добавляет Seq во все пакеты.
-                            // Нам нужно пропустить 4 байта Seq для TCP.
+                        if plaintext.len() <= 1 + 4 + pad_len {
                             let _ = tx_echo.send(Bytes::new()).await; 
                             continue; 
                         }
-                        // Пропускаем PadLen (1) + Seq (4)
                         let data = &plaintext[5..plaintext.len() - pad_len];
 
                         {

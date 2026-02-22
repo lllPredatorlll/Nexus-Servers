@@ -69,7 +69,7 @@ impl Default for NetConfig {
         Self {
             endpoint: "".to_string(),
             use_tcp: false,
-            ipv6: false, // По умолчанию выключено для стабильности
+            ipv6: false,
             split_tunnel: "".to_string(),
             kill_switch: false,
             app_list: vec![],

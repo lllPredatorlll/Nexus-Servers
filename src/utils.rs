@@ -127,7 +127,6 @@ pub async fn ping_server(endpoint: String) -> Result<u128, String> {
     }
 }
 
-// SIMD-оптимизированная функция XOR (AVX2)
 #[inline]
 pub fn xor_bytes(dst: &mut [u8], src: &[u8]) {
     let len = std::cmp::min(dst.len(), src.len());
@@ -139,7 +138,6 @@ pub fn xor_bytes(dst: &mut [u8], src: &[u8]) {
             while i + 32 <= len {
                 let d_ptr = dst.as_mut_ptr().add(i) as *mut __m256i;
                 let s_ptr = src.as_ptr().add(i) as *const __m256i;
-                // Используем unaligned load/store для безопасности
                 let d_val = _mm256_loadu_si256(d_ptr);
                 let s_val = _mm256_loadu_si256(s_ptr);
                 let res = _mm256_xor_si256(d_val, s_val);
