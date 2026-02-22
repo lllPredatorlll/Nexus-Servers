@@ -1,0 +1,59 @@
+name: Build and Publish Server
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    name: Build Linux Binary
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build Server
+        run: |
+          export RUSTFLAGS="-C target-cpu=x86-64-v3"
+          cargo build --release --bin server --target x86_64-unknown-linux-gnu --no-default-features
+
+      - name: Prepare Artifacts
+        run: |
+          mv target/x86_64-unknown-linux-gnu/release/server server_linux_amd64
+          
+          sha256sum server_linux_amd64 > server_linux_amd64.sha256
+          
+          VERSION=$(sed -n 's/^version\s*=\s*"\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo $VERSION > version.txt
+          echo "Build version: $VERSION"
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Build
+          body: "Автоматическая сборка сервера (Linux x64)."
+          allow_updates: true
+          prerelease: false
+          make_latest: true
+          files: |
+            server_linux_amd64
+            server_linux_amd64.sha256
+            version.txt
