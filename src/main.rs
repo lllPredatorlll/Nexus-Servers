@@ -327,7 +327,6 @@ async fn main() -> Result<()> {
     let udp_err_metric = total_err.clone();
     let udp_allowlist = client_allowlist.clone();
     let udp_client_stats = client_stats.clone();
-    let obf_key: Arc<Vec<u8>> = Arc::new(udp_config.security.psk.as_bytes().iter().cycle().take(4096).cloned().collect());
 
     let num_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let (_udp_tx_dispatch, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -359,13 +358,11 @@ async fn main() -> Result<()> {
             let next_ip_udp = next_ip_udp.clone();
             let handshake_cipher = handshake_cipher_base.clone();
             let auth_token = auth_token.to_vec();
-            let obf_key = obf_key.clone();
 
             tokio::spawn(async move {
                 let mut rng = StdRng::from_entropy();
                 while let Ok((mut buf, addr)) = rx_pkt.recv().await {
                     let len = buf.len();
-                    utils::xor_bytes(&mut buf, &obf_key);
                     udp_rx_metric.fetch_add(len as u64, Ordering::Relaxed);
                     if len < 28 { continue; }
 
@@ -511,7 +508,6 @@ async fn main() -> Result<()> {
                         let cipher_sender = session_cipher.clone();
                         let tx_metric = udp_tx_metric.clone();
                         let tx_stats_inner = peer_stats_tx.clone();
-                        let obf_key_sender = obf_key.clone();
                         
                         tokio::spawn(async move {
                             let rx = rx;
@@ -544,7 +540,6 @@ async fn main() -> Result<()> {
 
                                 if let Ok(tag) = cipher_sender.encrypt_in_place_detached(nonce, &[], &mut final_pkt[12..]) {
                                     final_pkt.put_slice(tag.as_slice());
-                                    utils::xor_bytes(&mut final_pkt, &obf_key_sender);
                                     if socket_sender.send_to(&final_pkt, addr).await.is_ok() {
                                         tx_metric.fetch_add(final_pkt.len() as u64, Ordering::Relaxed);
                                         if let Some(tx) = &tx_stats_inner {
@@ -594,7 +589,6 @@ async fn main() -> Result<()> {
                             let mut packet = Vec::with_capacity(12 + encrypted.len());
                             packet.extend_from_slice(&nonce_bytes);
                             packet.extend_from_slice(&encrypted);
-                            utils::xor_bytes(&mut packet, &obf_key);
                             if socket_recv.send_to(&packet, addr).await.is_ok() {
                                 udp_tx_metric.fetch_add(packet.len() as u64, Ordering::Relaxed);
                             }
@@ -621,7 +615,6 @@ async fn main() -> Result<()> {
 
                                 if let Ok(tag) = cipher.encrypt_in_place_detached(nonce, &[], &mut final_pkt[12..]) {
                                     final_pkt.extend_from_slice(tag.as_slice());
-                                    utils::xor_bytes(&mut final_pkt, &obf_key);
                                     let _ = socket_udp_send.send_to(&final_pkt, addr).await;
                                 }
                             }
