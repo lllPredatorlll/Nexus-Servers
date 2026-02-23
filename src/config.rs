@@ -82,14 +82,12 @@ impl Default for NetConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SecurityConfig {
-    pub psk: String,
     pub auth_token: String,
 }
 
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
-            psk: "".to_string(),
             auth_token: "".to_string(),
         }
     }

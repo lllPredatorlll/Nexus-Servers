@@ -6,10 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UdpSocket, TcpListener};
 use tokio::sync::RwLock;
-use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-use rand::{RngCore, rngs::{OsRng, StdRng}, SeedableRng};
-use x25519_dalek::{EphemeralSecret, PublicKey};
 use log::{info, error, warn, debug};
 use flexi_logger::{Logger, FileSpec, Criterion, Naming, Cleanup, Duplicate};
 use tun::Configuration;
@@ -24,7 +20,6 @@ mod config;
 const VERSION: &str = "0.9.003 dev";
 
 struct Peer {
-    cipher: ChaCha20Poly1305,
     _tx: async_channel::Sender<Bytes>,
     last_seen: Arc<AtomicU64>,
     client_token: Option<String>,
@@ -222,15 +217,6 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let (tx_pkt, rx_pkt) = async_channel::bounded::<(BytesMut, SocketAddr)>(16384);
 
-        let psk = udp_config.security.psk.as_bytes();
-        let handshake_cipher_base = match ChaCha20Poly1305::new_from_slice(psk) {
-            Ok(c) => c,
-            Err(e) => {
-                error!("UDP Task Error: Invalid PSK length: {}", e);
-                return;
-            }
-        };
-        let auth_token = udp_config.security.auth_token.as_bytes();
 
         for _ in 0..num_workers {
             let rx_pkt = rx_pkt.clone();
@@ -244,81 +230,49 @@ async fn main() -> Result<()> {
             let udp_allowlist = udp_allowlist.clone();
             let udp_client_stats = udp_client_stats.clone();
             let next_ip_udp = next_ip_udp.clone();
-            let handshake_cipher = handshake_cipher_base.clone();
-            let auth_token = auth_token.to_vec();
+            let auth_token = udp_config.security.auth_token.as_bytes().to_vec();
 
             tokio::spawn(async move {
-                let mut rng = StdRng::from_entropy();
                 while let Ok((mut buf, addr)) = rx_pkt.recv().await {
                     let len = buf.len();
                     udp_rx_metric.fetch_add(len as u64, Ordering::Relaxed);
-                    if len < 28 { continue; }
+                    if len < 1 { continue; }
 
-                    let (peer_cipher, _peer_token, peer_stats_rx, peer_last_seen) = {
+                    let packet_type = buf[0];
+
+                    // Check if it's a known peer (Data packet)
+                    let (peer_tx, _peer_token, peer_stats_rx, peer_last_seen) = {
                         let lock = peers_recv.read().await;
                         if let Some(p) = lock.get(&addr) {
-                            (Some(p.cipher.clone()), p.client_token.clone(), p.stats_rx.clone(), Some(p.last_seen.clone()))
+                            (Some(p._tx.clone()), p.client_token.clone(), p.stats_rx.clone(), Some(p.last_seen.clone()))
                         } else {
                             (None, None, None, None)
                         }
                     };
 
-                    if let Some(rx) = &peer_stats_rx {
-                        rx.fetch_add(len as u64, Ordering::Relaxed);
-                    }
-                    if let Some(ls) = peer_last_seen {
-                        ls.store(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(), Ordering::Relaxed);
-                    }
-
-                    let mut decrypted_data = Vec::new();
-                    let mut is_handshake = false;
-
-                    if let Some(ref cipher) = peer_cipher {
-                        let mut nonce_arr = [0u8; 12];
-                        nonce_arr.copy_from_slice(&buf[..12]);
-                        let nonce = Nonce::from_slice(&nonce_arr);
-
-                        let ciphertext_len = len - 12;
-                        let data_len = ciphertext_len - 16;
-                        
-                        let mut tag_arr = [0u8; 16];
-                        tag_arr.copy_from_slice(&buf[len-16..len]);
-                        let tag = chacha20poly1305::Tag::from_slice(&tag_arr);
-                        
-                        if cipher.decrypt_in_place_detached(nonce, &[], &mut buf[12..12+data_len], tag).is_ok() {
-                            let pad_len = buf[12] as usize;
-                            
-                            if data_len > 1 + 4 + pad_len {
-                                let data = &buf[17 .. 12 + data_len - pad_len];
-                                let data_bytes = Bytes::copy_from_slice(data);
-                                
-                                let _ = tun_tx_udp.send(data_bytes.clone()).await;
-                                
-                                continue;
-                            } else {
-                                decrypted_data = buf[12..12+data_len].to_vec();
+                    // If peer exists and it's a data packet (IPv4 starts with 0x4, IPv6 with 0x6)
+                    // Handshake starts with 0x01.
+                    if let Some(_) = peer_tx {
+                        if packet_type != 0x01 {
+                            if let Some(rx) = &peer_stats_rx {
+                                rx.fetch_add(len as u64, Ordering::Relaxed);
                             }
+                            if let Some(ls) = peer_last_seen {
+                                ls.store(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(), Ordering::Relaxed);
+                            }
+                            let data_bytes = Bytes::copy_from_slice(&buf);
+                            let _ = tun_tx_udp.send(data_bytes).await;
+                            continue;
                         }
                     }
 
-                    if decrypted_data.is_empty() {
-                        let nonce = Nonce::from_slice(&buf[..12]);
-                        if let Ok(plaintext) = handshake_cipher.decrypt(nonce, &buf[12..len]) {
-                            if plaintext.len() >= 32 {
-                                is_handshake = true;
-                                decrypted_data = plaintext;
-                            }
-                        }
-                    }
-
-                    if decrypted_data.is_empty() { continue; }
-
-                    if is_handshake {
-                        if decrypted_data.len() < 33 { continue; }
-                        let token_len = decrypted_data[32] as usize;
-                        if decrypted_data.len() < 33 + token_len { continue; }
+                    // Handshake: [0x01 | token_len | token]
+                    if packet_type == 0x01 {
+                        if len < 2 { continue; }
+                        let token_len = buf[1] as usize;
+                        if len < 2 + token_len { continue; }
                         
-                        let token_sent = &decrypted_data[33..33+token_len];
+                        let token_sent = &buf[2..2+token_len];
                         let mut client_token_found = None;
 
                         if token_sent != auth_token.as_slice() {
@@ -333,17 +287,6 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                         }
-
-                        let mut client_pub_bytes = [0u8; 32];
-                        client_pub_bytes.copy_from_slice(&decrypted_data[..32]);
-                        let client_public = PublicKey::from(client_pub_bytes);
-
-                        let server_secret = EphemeralSecret::random_from_rng(OsRng);
-                        let server_public = PublicKey::from(&server_secret);
-                        let shared_secret = server_secret.diffie_hellman(&client_public);
-                        
-                        let session_key = shared_secret.as_bytes();
-                        let session_cipher = ChaCha20Poly1305::new(session_key.into());
 
                         let client_ip_octet = {
                             let mut ip = next_ip_udp.lock().unwrap();
@@ -364,44 +307,16 @@ async fn main() -> Result<()> {
 
                         let (tx, rx) = async_channel::bounded::<Bytes>(16384);
                         let socket_sender = socket_udp_send.clone();
-                        let cipher_sender = session_cipher.clone();
                         let tx_metric = udp_tx_metric.clone();
                         let tx_stats_inner = peer_stats_tx.clone();
                         
                         tokio::spawn(async move {
                             let rx = rx;
-                            let mut rng = StdRng::from_entropy();
-                            let mut final_pkt = BytesMut::with_capacity(2048);
-                            
-                            let mut nonce_salt = [0u8; 4];
-                            rng.fill_bytes(&mut nonce_salt);
-                            let mut seq: u64 = 0;
-
                             while let Ok(packet) = rx.recv().await {
-                                let pad_len = 0;
-
-                                seq = seq.wrapping_add(1);
-                                let mut nonce_bytes = [0u8; 12];
-                                nonce_bytes[..4].copy_from_slice(&nonce_salt);
-                                nonce_bytes[4..].copy_from_slice(&seq.to_be_bytes());
-                                let nonce = Nonce::from_slice(&nonce_bytes);
-
-                                let total_len = 12 + 1 + 4 + packet.len() + pad_len + 16;
-                                final_pkt.clear();
-                                final_pkt.reserve(total_len);
-                                
-                                final_pkt.put_slice(&nonce_bytes);
-                                final_pkt.put_u8(pad_len as u8);
-                                final_pkt.put_slice(&[0u8; 4]); // Dummy Seq
-                                final_pkt.put_slice(&packet);
-
-                                if let Ok(tag) = cipher_sender.encrypt_in_place_detached(nonce, &[], &mut final_pkt[12..]) {
-                                    final_pkt.put_slice(tag.as_slice());
-                                    if socket_sender.send_to(&final_pkt, addr).await.is_ok() {
-                                        tx_metric.fetch_add(final_pkt.len() as u64, Ordering::Relaxed);
-                                        if let Some(tx) = &tx_stats_inner {
-                                            tx.fetch_add(final_pkt.len() as u64, Ordering::Relaxed);
-                                        }
+                                if socket_sender.send_to(&packet, addr).await.is_ok() {
+                                    tx_metric.fetch_add(packet.len() as u64, Ordering::Relaxed);
+                                    if let Some(tx) = &tx_stats_inner {
+                                        tx.fetch_add(packet.len() as u64, Ordering::Relaxed);
                                     }
                                 }
                             }
@@ -412,7 +327,6 @@ async fn main() -> Result<()> {
                         {
                             let mut lock = peers_recv.write().await;
                             lock.insert(addr, Peer { 
-                                cipher: session_cipher, 
                                 _tx: tx.clone(), 
                                 last_seen, 
                                 client_token: client_token_found.clone(),
@@ -430,56 +344,14 @@ async fn main() -> Result<()> {
                         }
                         println!("Новый клиент: {} -> {}", addr, client_ip);
 
-                        let mut nonce_bytes = [0u8; 12];
-                        OsRng.fill_bytes(&mut nonce_bytes);
-                        let nonce = Nonce::from_slice(&nonce_bytes);
+                        // Response: [0x02 | ipv4 | ipv6]
+                        let mut response = Vec::with_capacity(1 + 4 + 16);
+                        response.push(0x02);
+                        response.extend_from_slice(&client_ip.octets());
+                        response.extend_from_slice(&client_ip_v6.octets());
 
-                        let mut payload = Vec::with_capacity(70);
-                        payload.extend_from_slice(server_public.as_bytes());
-                        payload.extend_from_slice(&client_ip.octets());
-                        payload.extend_from_slice(&client_ip_v6.octets());
-                        payload.resize(64, 0);
-                        OsRng.fill_bytes(&mut payload[52..]);
-
-                        if let Ok(encrypted) = handshake_cipher.encrypt(nonce, payload.as_slice()) {
-                            let mut packet = Vec::with_capacity(12 + encrypted.len());
-                            packet.extend_from_slice(&nonce_bytes);
-                            packet.extend_from_slice(&encrypted);
-                            if socket_recv.send_to(&packet, addr).await.is_ok() {
-                                udp_tx_metric.fetch_add(packet.len() as u64, Ordering::Relaxed);
-                            }
-                        }
-
-                    } else {
-                        let pad_len = decrypted_data[0] as usize;
-                        if decrypted_data.len() <= 1 + 4 + pad_len { 
-                            if let Some(cipher) = peer_cipher {
-                                let mut rand_buf = [0u8; 32];
-                                rng.fill_bytes(&mut rand_buf);
-
-                                let resp_pad_len = 15;
-                                let nonce_bytes = &rand_buf[0..12];
-                                let nonce = Nonce::from_slice(nonce_bytes);
-                                let padding_bytes = &rand_buf[12..12+resp_pad_len];
-
-                                let total_len = 12 + 1 + 0 + resp_pad_len + 16;
-                                let mut final_pkt = Vec::with_capacity(total_len);
-                                
-                                final_pkt.extend_from_slice(nonce_bytes);
-                                final_pkt.push(resp_pad_len as u8);
-                                final_pkt.extend_from_slice(padding_bytes);
-
-                                if let Ok(tag) = cipher.encrypt_in_place_detached(nonce, &[], &mut final_pkt[12..]) {
-                                    final_pkt.extend_from_slice(tag.as_slice());
-                                    let _ = socket_udp_send.send_to(&final_pkt, addr).await;
-                                }
-                            }
-                            continue; 
-                        }
-                        let data = &decrypted_data[5..decrypted_data.len() - pad_len]; 
-
-                        {
-                            let _ = tun_tx_udp.send(Bytes::copy_from_slice(data)).await;
+                        if socket_recv.send_to(&response, addr).await.is_ok() {
+                            udp_tx_metric.fetch_add(response.len() as u64, Ordering::Relaxed);
                         }
                     }
                 }
@@ -511,14 +383,6 @@ async fn main() -> Result<()> {
     let tcp_client_stats = client_stats.clone();
 
         tokio::spawn(async move {
-        let psk = tcp_config.security.psk.as_bytes();
-        let handshake_cipher = match ChaCha20Poly1305::new_from_slice(psk) {
-            Ok(c) => c,
-            Err(e) => {
-                error!("TCP Task Error: Invalid PSK length: {}", e);
-                return;
-            }
-        };
         let auth_token = tcp_config.security.auth_token.as_bytes().to_vec();
         
         loop {
@@ -531,7 +395,6 @@ async fn main() -> Result<()> {
             
             let tun_tx_tcp = tun_tx.clone();
             let ip_map = ip_map_tcp.clone();
-            let handshake_cipher = handshake_cipher.clone();
             let auth_token = auth_token.clone();
             let next_ip = next_ip_tcp.clone();
             let rx_m = tcp_rx_metric.clone();
@@ -542,81 +405,20 @@ async fn main() -> Result<()> {
 
             tokio::spawn(async move {
                 let mut stream = stream;
-                let mut first_byte = [0u8; 1];
-                if stream.read_exact(&mut first_byte).await.is_err() { return; }
-
-                if first_byte[0] != 0x16 { return; }
-
-                let mut header = [0u8; 4];
-                if stream.read_exact(&mut header).await.is_err() { return; }
-                let ch_len = u16::from_be_bytes([header[2], header[3]]) as usize;
-                let mut ch_buf = vec![0u8; ch_len];
-                if stream.read_exact(&mut ch_buf).await.is_err() { return; }
-
-                let mut rng = StdRng::from_entropy();
-                let mut rand_bytes = [0u8; 32];
-                rng.fill_bytes(&mut rand_bytes);
-                let mut session_id = [0u8; 32];
-                rng.fill_bytes(&mut session_id);
-
-                let mut sh_payload = Vec::new();
-                sh_payload.extend_from_slice(&[0x03, 0x03]);
-                sh_payload.extend_from_slice(&rand_bytes);
-                sh_payload.push(32);
-                sh_payload.extend_from_slice(&session_id);
-                sh_payload.extend_from_slice(&[0x13, 0x01]);
-                sh_payload.push(0x00);
-                sh_payload.extend_from_slice(&[0x00, 0x00]);
-
-                let mut sh_record = Vec::new();
-                sh_record.push(0x16);
-                sh_record.extend_from_slice(&[0x03, 0x03]);
-                sh_record.extend_from_slice(&(4 + sh_payload.len() as u16).to_be_bytes());
-                sh_record.push(0x02);
-                sh_record.extend_from_slice(&(sh_payload.len() as u32).to_be_bytes()[1..4]);
-                sh_record.extend_from_slice(&sh_payload);
-
-                let ccs = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
-                let mut fake_fin = vec![0x17, 0x03, 0x03, 0x00, 0x20];
-                let mut fin_payload = [0u8; 32];
-                rng.fill_bytes(&mut fin_payload);
-                fake_fin.extend_from_slice(&fin_payload);
-
-                stream.write_all(&sh_record).await.ok();
-                stream.write_all(&ccs).await.ok();
-                stream.write_all(&fake_fin).await.ok();
-
-                let mut buf = [0u8; 1024];
-                let mut hdr = [0u8; 5];
-                if stream.read_exact(&mut hdr).await.is_ok() && hdr[0] == 0x14 {
-                    let l = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
-                    if l <= buf.len() { stream.read_exact(&mut buf[..l]).await.ok(); }
-                    if stream.read_exact(&mut hdr).await.is_ok() && hdr[0] == 0x17 {
-                        let l = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
-                        if l <= buf.len() { stream.read_exact(&mut buf[..l]).await.ok(); }
-                    }
-                }
-
-                if stream.read_exact(&mut hdr).await.is_err() { return; }
-                if hdr[0] != 0x17 { return; }
-                let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
-
+                // Read handshake frame: [len(2) | 0x01 | token_len | token]
+                let mut len_buf = [0u8; 2];
+                if stream.read_exact(&mut len_buf).await.is_err() { return; }
+                let len = u16::from_be_bytes(len_buf) as usize;
+                
                 let mut buf = vec![0u8; len];
                 if stream.read_exact(&mut buf).await.is_err() { return; }
                 rx_m.fetch_add((2 + len) as u64, Ordering::Relaxed);
 
-                if len < 12 { return; }
-                let nonce = Nonce::from_slice(&buf[..12]);
-                let decrypted = match handshake_cipher.decrypt(nonce, &buf[12..]) {
-                    Ok(d) => d,
-                    Err(_) => return,
-                };
+                if len < 2 || buf[0] != 0x01 { return; }
+                let token_len = buf[1] as usize;
+                if len < 2 + token_len { return; }
                 
-                if decrypted.len() < 33 { return; }
-                let token_len = decrypted[32] as usize;
-                if decrypted.len() < 33 + token_len { return; }
-                
-                let token_sent = &decrypted[33..33+token_len];
+                let token_sent = &buf[2..2+token_len];
                 let mut client_token_found = None;
 
                 if token_sent != auth_token.as_slice() {
@@ -632,16 +434,6 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                let mut client_pub_bytes = [0u8; 32];
-                client_pub_bytes.copy_from_slice(&decrypted[..32]);
-                let client_public = PublicKey::from(client_pub_bytes);
-
-                let server_secret = EphemeralSecret::random_from_rng(OsRng);
-                let server_public = PublicKey::from(&server_secret);
-                let shared_secret = server_secret.diffie_hellman(&client_public);
-                let session_key = shared_secret.as_bytes();
-                let session_cipher = ChaCha20Poly1305::new(session_key.into());
-
                 let client_ip_octet = {
                     let mut ip = next_ip.lock().unwrap();
                     let val = *ip;
@@ -651,28 +443,17 @@ async fn main() -> Result<()> {
                 let client_ip = Ipv4Addr::new(10, 0, 0, client_ip_octet);
                 let client_ip_v6 = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, client_ip_octet as u16);
 
-                let mut nonce_bytes = [0u8; 12];
-                OsRng.fill_bytes(&mut nonce_bytes);
-                let nonce = Nonce::from_slice(&nonce_bytes);
-
-                let mut payload = Vec::with_capacity(70);
-                payload.extend_from_slice(server_public.as_bytes());
-                payload.extend_from_slice(&client_ip.octets());
-                payload.extend_from_slice(&client_ip_v6.octets());
-                payload.resize(64, 0);
-                OsRng.fill_bytes(&mut payload[52..]);
-
-                if let Ok(encrypted) = handshake_cipher.encrypt(nonce, payload.as_slice()) {
-                    let mut packet = Vec::with_capacity(12 + encrypted.len());
-                    packet.extend_from_slice(&nonce_bytes);
-                    packet.extend_from_slice(&encrypted);
-                    
-                    let mut combined = Vec::with_capacity(2 + packet.len());
-                    combined.extend_from_slice(&(packet.len() as u16).to_be_bytes());
-                    combined.extend_from_slice(&packet);
-                    if stream.write_all(&combined).await.is_err() { return; }
-                    tx_m.fetch_add((2 + packet.len()) as u64, Ordering::Relaxed);
-                }
+                // Response: [len(2) | 0x02 | ipv4 | ipv6]
+                let mut response = Vec::with_capacity(1 + 4 + 16);
+                response.push(0x02);
+                response.extend_from_slice(&client_ip.octets());
+                response.extend_from_slice(&client_ip_v6.octets());
+                
+                let mut combined = Vec::with_capacity(2 + response.len());
+                combined.extend_from_slice(&(response.len() as u16).to_be_bytes());
+                combined.extend_from_slice(&response);
+                if stream.write_all(&combined).await.is_err() { return; }
+                tx_m.fetch_add(combined.len() as u64, Ordering::Relaxed);
 
                 if let Some(token) = &client_token_found {
                     let mut lock = client_stats.write().await;
@@ -697,8 +478,6 @@ async fn main() -> Result<()> {
                 info!("TCP клиент подключен: {} -> {}", addr, client_ip);
 
                 let (mut read_half, write_half) = stream.into_split();
-                let cipher_enc = session_cipher.clone();
-                let cipher_dec = session_cipher.clone();
                 let tx_m_inner = tx_m.clone();
                 let rx_m_inner = rx_m.clone();
                 let tx_stats_inner = peer_stats_tx.clone();
@@ -708,39 +487,16 @@ async fn main() -> Result<()> {
                     let rx = rx;
                     let mut write_half = write_half;
                     let mut combined_buf = BytesMut::with_capacity(2048);
-                    let mut rng = StdRng::from_entropy();
                     
-                    let mut nonce_salt = [0u8; 4];
-                    rng.fill_bytes(&mut nonce_salt);
-                    let mut seq: u64 = 0;
-
                     while let Ok(packet) = rx.recv().await {
-                        seq = seq.wrapping_add(1);
-                        let mut nonce_bytes = [0u8; 12];
-                        nonce_bytes[..4].copy_from_slice(&nonce_salt);
-                        nonce_bytes[4..].copy_from_slice(&seq.to_be_bytes());
-                        let nonce = Nonce::from_slice(&nonce_bytes);
+                        combined_buf.clear();
+                        combined_buf.put_u16(packet.len() as u16);
+                        combined_buf.put_slice(&packet);
 
-                        let total_len = 12 + packet.len() + 16;
-                        let mut final_pkt = BytesMut::with_capacity(total_len);
-                        
-                        final_pkt.put_slice(&nonce_bytes);
-                        final_pkt.put_slice(&packet);
-
-                        if let Ok(tag) = cipher_enc.encrypt_in_place_detached(nonce, &[], &mut final_pkt[12..]) {
-                            final_pkt.put_slice(tag.as_slice());
-                            
-                            combined_buf.clear();
-                            combined_buf.put_u8(0x17);
-                            combined_buf.put_slice(&[0x03, 0x03]);
-                            combined_buf.put_u16(final_pkt.len() as u16);
-                            combined_buf.put_slice(&final_pkt);
-
-                            if write_half.write_all(&combined_buf).await.is_err() { break; }
-                            tx_m_inner.fetch_add((2 + final_pkt.len()) as u64, Ordering::Relaxed);
-                            if let Some(tx) = &tx_stats_inner {
-                                tx.fetch_add((2 + final_pkt.len()) as u64, Ordering::Relaxed);
-                            }
+                        if write_half.write_all(&combined_buf).await.is_err() { break; }
+                        tx_m_inner.fetch_add((2 + packet.len()) as u64, Ordering::Relaxed);
+                        if let Some(tx) = &tx_stats_inner {
+                            tx.fetch_add((2 + packet.len()) as u64, Ordering::Relaxed);
                         }
                     }
                 });
@@ -748,9 +504,8 @@ async fn main() -> Result<()> {
                 let mut buf = BytesMut::with_capacity(65536);
                 loop {
                     let mut hdr = [0u8; 5];
-                    if read_half.read_exact(&mut hdr).await.is_err() { break; }
-                    if hdr[0] != 0x17 { break; }
-                    let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                    if read_half.read_exact(&mut hdr[..2]).await.is_err() { break; }
+                    let len = u16::from_be_bytes([hdr[0], hdr[1]]) as usize;
 
                     if buf.capacity() < len { buf.reserve(len); }
                     buf.resize(len, 0);
@@ -761,16 +516,8 @@ async fn main() -> Result<()> {
                         rx.fetch_add((2 + len) as u64, Ordering::Relaxed);
                     }
 
-                    if len < 28 { continue; }
-                    let nonce = Nonce::from_slice(&buf[..12]);
-                    if let Ok(plaintext) = cipher_dec.decrypt(nonce, &buf[12..]) {
-                        if plaintext.is_empty() { continue; }
-                        let data = &plaintext;
-
-                        {
-                            let _ = tun_tx_tcp.send(Bytes::copy_from_slice(data)).await;
-                        }
-                    }
+                    let data = Bytes::copy_from_slice(&buf);
+                    let _ = tun_tx_tcp.send(data).await;
                 }
 
                 t_write.abort();
