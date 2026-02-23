@@ -233,7 +233,7 @@ async fn main() -> Result<()> {
             let auth_token = udp_config.security.auth_token.as_bytes().to_vec();
 
             tokio::spawn(async move {
-                while let Ok((mut buf, addr)) = rx_pkt.recv().await {
+                while let Ok((buf, addr)) = rx_pkt.recv().await {
                     let len = buf.len();
                     udp_rx_metric.fetch_add(len as u64, Ordering::Relaxed);
                     if len < 1 { continue; }
