@@ -852,7 +852,6 @@ async fn main() -> Result<()> {
                 let cipher_dec = session_cipher.clone();
                 let tx_m_inner = tx_m.clone();
                 let rx_m_inner = rx_m.clone();
-                let tx_echo = tx.clone();
                 let tx_stats_inner = peer_stats_tx.clone();
                 let rx_stats_inner = peer_stats_rx.clone();
 
