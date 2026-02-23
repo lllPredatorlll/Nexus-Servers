@@ -10,12 +10,6 @@ pub struct Config {
     pub net: NetConfig,
     #[serde(default)]
     pub security: SecurityConfig,
-    #[serde(default)]
-    pub ssh: SshConfig,
-    #[serde(default)]
-    pub ui: UiConfig,
-    #[serde(default)]
-    pub adblock: AdblockConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -89,80 +83,6 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             auth_token: "".to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct SshConfig {
-    #[serde(default)]
-    pub ip: String,
-    #[serde(default = "default_user")]
-    pub user: String,
-    #[serde(default = "default_auth_method")]
-    pub auth_method: String,
-    #[serde(default)]
-    pub key_path: String,
-}
-
-fn default_user() -> String { "root".to_string() }
-fn default_auth_method() -> String { "password".to_string() }
-
-impl Default for SshConfig {
-    fn default() -> Self {
-        Self {
-            ip: "".to_string(),
-            user: default_user(),
-            auth_method: default_auth_method(),
-            key_path: "".to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct UiConfig {
-    #[serde(default = "default_language")]
-    pub language: String,
-    #[serde(default = "default_theme")]
-    pub theme: String,
-    #[serde(default)]
-    pub acrylic: bool,
-    #[serde(default = "default_transparency")]
-    pub transparency: f64,
-    #[serde(default = "default_tint")]
-    pub tint: f64,
-}
-
-fn default_language() -> String { "ru".to_string() }
-fn default_theme() -> String { "dark".to_string() }
-fn default_transparency() -> f64 { 1.0 }
-fn default_tint() -> f64 { 0.25 }
-
-impl Default for UiConfig {
-    fn default() -> Self {
-        Self {
-            language: default_language(),
-            theme: default_theme(),
-            acrylic: false,
-            transparency: default_transparency(),
-            tint: default_tint(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct AdblockConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub domains: Vec<String>,
-}
-
-impl Default for AdblockConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            domains: vec![],
         }
     }
 }

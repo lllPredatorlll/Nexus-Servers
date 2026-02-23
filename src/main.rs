@@ -13,7 +13,6 @@ use serde::{Serialize, Deserialize};
 use socket2::{Socket, Domain, Type, Protocol};
 use bytes::{Bytes, BytesMut, BufMut};
 
-mod utils;
 mod config;
 
 
