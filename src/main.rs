@@ -601,7 +601,7 @@ async fn main() -> Result<()> {
 
                     } else {
                         let pad_len = decrypted_data[0] as usize;
-                        if decrypted_data.len() <= 1 + pad_len { 
+                        if decrypted_data.len() <= 1 + 4 + pad_len { 
                             if let Some(cipher) = peer_cipher {
                                 let mut rand_buf = [0u8; 32];
                                 rng.fill_bytes(&mut rand_buf);
