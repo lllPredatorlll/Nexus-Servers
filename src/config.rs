@@ -33,7 +33,7 @@ impl Default for TunConfig {
             destination: "10.0.0.254".to_string(),
             address_v6: default_address_v6(),
             destination_v6: default_destination_v6(),
-            mtu: 1420,
+            mtu: 1280,
         }
     }
 }

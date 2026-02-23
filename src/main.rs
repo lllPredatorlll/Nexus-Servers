@@ -80,6 +80,9 @@ async fn main() -> Result<()> {
         let _ = std::process::Command::new("ip")
             .args(&["-6", "addr", "add", &app_config.tun.address_v6, "dev", "nexus0"])
             .output();
+        let _ = std::process::Command::new("ip")
+            .args(&["link", "set", "dev", "nexus0", "txqueuelen", "1000"])
+            .output();
     }
 
     let (tun_tx, tun_rx) = async_channel::bounded::<Bytes>(16384);
