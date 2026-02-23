@@ -23,117 +23,6 @@ mod config;
 
 const VERSION: &str = "0.9.003 dev";
 
-struct FecGroup {
-    parity: Option<Bytes>,
-    packets: HashMap<u32, Bytes>,
-    received_count: usize,
-    created_at: std::time::Instant,
-}
-
-struct FecReconstructor {
-    active_groups: HashMap<u32, FecGroup>,
-    last_cleanup: std::time::Instant,
-}
-
-impl FecReconstructor {
-    fn new() -> Self {
-        Self { 
-            active_groups: HashMap::new(),
-            last_cleanup: std::time::Instant::now(),
-        }
-    }
-
-    fn on_packet(&mut self, seq: u32, data: Bytes) -> Option<Vec<u8>> {
-        self.cleanup();
-        let group_seq = if seq > 0 { ((seq - 1) / 20) * 20 + 1 } else { 0 };
-        
-        let group = self.active_groups.entry(group_seq).or_insert_with(|| FecGroup { 
-            parity: None, 
-            packets: HashMap::new(), 
-            received_count: 0,
-            created_at: std::time::Instant::now() 
-        });
-
-        if !group.packets.contains_key(&seq) {
-            group.packets.insert(seq, data);
-            group.received_count += 1;
-        }
-        self.try_recover(group_seq)
-    }
-
-     fn on_parity(&mut self, group_seq: u32, parity: Bytes) -> Option<Vec<u8>> {
-        self.cleanup();
-
-        let group = self.active_groups.entry(group_seq).or_insert_with(|| FecGroup { 
-            parity: None, 
-            packets: HashMap::new(), 
-            received_count: 0,
-            created_at: std::time::Instant::now() 
-        });
-        group.parity = Some(parity);
-        self.try_recover(group_seq)
-    }
-
-    fn try_recover(&mut self, group_seq: u32) -> Option<Vec<u8>> {
-        let group = self.active_groups.get_mut(&group_seq)?;
-        let k = 20;
-        if group.received_count == k { self.active_groups.remove(&group_seq); return None; }
-
-        if group.received_count == k - 1 && group.parity.is_some() {
-            let mut recovered = group.parity.as_ref().unwrap().to_vec();
-            for (_, pkt) in &group.packets {
-                let len_bytes = (pkt.len() as u16).to_be_bytes();
-                if recovered.len() < 2 { recovered.resize(2, 0); }
-                recovered[0] ^= len_bytes[0]; recovered[1] ^= len_bytes[1];
-                if recovered.len() < 2 + pkt.len() { recovered.resize(2 + pkt.len(), 0); }
-                
-                crate::utils::xor_bytes(&mut recovered[2..2+pkt.len()], pkt);
-            }
-            if recovered.len() < 2 { return None; }
-            let rec_len = u16::from_be_bytes([recovered[0], recovered[1]]) as usize;
-            if recovered.len() >= 2 + rec_len { self.active_groups.remove(&group_seq); return Some(recovered[2..2+rec_len].to_vec()); }
-        }
-        None
-    }
-
-    fn cleanup(&mut self) {
-        let now = std::time::Instant::now();
-        if now.duration_since(self.last_cleanup).as_secs() >= 1 {
-            self.active_groups.retain(|_, group| now.duration_since(group.created_at).as_secs() < 2);
-            self.last_cleanup = now;
-        }
-    }
-}
-
-struct ShardedFecReconstructor {
-    shards: Vec<Mutex<FecReconstructor>>,
-    mask: usize,
-}
-
-impl ShardedFecReconstructor {
-    fn new() -> Self {
-        let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let count = parallelism.next_power_of_two();
-        let mut shards = Vec::with_capacity(count);
-        for _ in 0..count {
-            shards.push(Mutex::new(FecReconstructor::new()));
-        }
-        Self { shards, mask: count - 1 }
-    }
-
-    fn on_packet(&self, seq: u32, data: Bytes) -> Option<Vec<u8>> {
-        let group_idx = if seq > 0 { (seq - 1) / 20 } else { 0 };
-        let idx = (group_idx as usize) & self.mask;
-        self.shards[idx].lock().unwrap().on_packet(seq, data)
-    }
-
-    fn on_parity(&self, group_seq: u32, parity: Bytes) -> Option<Vec<u8>> {
-        let group_idx = if group_seq > 0 { (group_seq - 1) / 20 } else { 0 };
-        let idx = (group_idx as usize) & self.mask;
-        self.shards[idx].lock().unwrap().on_parity(group_seq, parity)
-    }
-}
-
 struct Peer {
     cipher: ChaCha20Poly1305,
     _tx: async_channel::Sender<Bytes>,
@@ -143,7 +32,6 @@ struct Peer {
     ipv6: Ipv6Addr,
     _stats_tx: Option<Arc<AtomicU64>>,
     stats_rx: Option<Arc<AtomicU64>>,
-    fec: Arc<ShardedFecReconstructor>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -366,12 +254,12 @@ async fn main() -> Result<()> {
                     udp_rx_metric.fetch_add(len as u64, Ordering::Relaxed);
                     if len < 28 { continue; }
 
-                    let (peer_cipher, _peer_token, peer_stats_rx, peer_last_seen, peer_fec) = {
+                    let (peer_cipher, _peer_token, peer_stats_rx, peer_last_seen) = {
                         let lock = peers_recv.read().await;
                         if let Some(p) = lock.get(&addr) {
-                            (Some(p.cipher.clone()), p.client_token.clone(), p.stats_rx.clone(), Some(p.last_seen.clone()), Some(p.fec.clone()))
+                            (Some(p.cipher.clone()), p.client_token.clone(), p.stats_rx.clone(), Some(p.last_seen.clone()))
                         } else {
-                            (None, None, None, None, None)
+                            (None, None, None, None)
                         }
                     };
 
@@ -400,41 +288,12 @@ async fn main() -> Result<()> {
                         if cipher.decrypt_in_place_detached(nonce, &[], &mut buf[12..12+data_len], tag).is_ok() {
                             let pad_len = buf[12] as usize;
                             
-                            if pad_len == 254 {
-                                if let Some(fec_lock) = peer_fec {
-                                    if data_len > 5 {
-                                        let mut seq_bytes = [0u8; 4];
-                                        seq_bytes.copy_from_slice(&buf[13..17]);
-                                        let group_seq = u32::from_be_bytes(seq_bytes);
-                                        let parity_data = &buf[17..12+data_len];
-                                        let parity_bytes = Bytes::copy_from_slice(parity_data);
-                                        
-                                        let recovered_opt = fec_lock.on_parity(group_seq, parity_bytes);
-                                        if let Some(recovered) = recovered_opt {
-                                            let _ = tun_tx_udp.send(Bytes::from(recovered)).await;
-                                            debug!("FEC: Восстановлен пакет в группе {}", group_seq);
-                                        }
-                                    }
-                                }
-                                continue; 
-                            }
-
                             if data_len > 1 + 4 + pad_len {
-                                let mut seq_bytes = [0u8; 4];
-                                seq_bytes.copy_from_slice(&buf[13..17]);
-                                let seq = u32::from_be_bytes(seq_bytes);
                                 let data = &buf[17 .. 12 + data_len - pad_len];
                                 let data_bytes = Bytes::copy_from_slice(data);
                                 
                                 let _ = tun_tx_udp.send(data_bytes.clone()).await;
                                 
-                                if let Some(fec_lock) = peer_fec {
-                                    let recovered_opt = fec_lock.on_packet(seq, data_bytes);
-                                    if let Some(recovered) = recovered_opt {
-                                        let _ = tun_tx_udp.send(Bytes::from(recovered)).await;
-                                        debug!("FEC: Восстановлен пакет {} (позднее прибытие)", seq);
-                                    }
-                                }
                                 continue;
                             } else {
                                 decrypted_data = buf[12..12+data_len].to_vec();
@@ -519,8 +378,7 @@ async fn main() -> Result<()> {
                             let mut seq: u64 = 0;
 
                             while let Ok(packet) = rx.recv().await {
-                                let payload_len = 1 + packet.len();
-                                let pad_len = (16 - (payload_len % 16)) % 16;
+                                let pad_len = 0;
 
                                 seq = seq.wrapping_add(1);
                                 let mut nonce_bytes = [0u8; 12];
@@ -536,7 +394,6 @@ async fn main() -> Result<()> {
                                 final_pkt.put_u8(pad_len as u8);
                                 final_pkt.put_slice(&[0u8; 4]); // Dummy Seq
                                 final_pkt.put_slice(&packet);
-                                final_pkt.put_bytes(0, pad_len);
 
                                 if let Ok(tag) = cipher_sender.encrypt_in_place_detached(nonce, &[], &mut final_pkt[12..]) {
                                     final_pkt.put_slice(tag.as_slice());
@@ -563,7 +420,6 @@ async fn main() -> Result<()> {
                                 ipv6: client_ip_v6,
                                 _stats_tx: peer_stats_tx,
                                 stats_rx: peer_stats_rx,
-                        fec: Arc::new(ShardedFecReconstructor::new())
                             });
                         }
 
