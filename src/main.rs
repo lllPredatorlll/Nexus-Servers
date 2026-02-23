@@ -532,12 +532,13 @@ async fn main() -> Result<()> {
                                 nonce_bytes[4..].copy_from_slice(&seq.to_be_bytes());
                                 let nonce = Nonce::from_slice(&nonce_bytes);
 
-                                let total_len = 12 + 1 + packet.len() + pad_len + 16;
+                                let total_len = 12 + 1 + 4 + packet.len() + pad_len + 16;
                                 final_pkt.clear();
                                 final_pkt.reserve(total_len);
                                 
                                 final_pkt.put_slice(&nonce_bytes);
                                 final_pkt.put_u8(pad_len as u8);
+                                final_pkt.put_slice(&[0u8; 4]); // Dummy Seq
                                 final_pkt.put_slice(&packet);
                                 final_pkt.put_bytes(0, pad_len);
 
@@ -626,7 +627,7 @@ async fn main() -> Result<()> {
                             }
                             continue; 
                         }
-                        let data = &decrypted_data[1..decrypted_data.len() - pad_len]; 
+                        let data = &decrypted_data[5..decrypted_data.len() - pad_len]; 
 
                         {
                             let _ = tun_tx_udp.send(Bytes::copy_from_slice(data)).await;
@@ -866,22 +867,17 @@ async fn main() -> Result<()> {
                     let mut seq: u64 = 0;
 
                     while let Ok(packet) = rx.recv().await {
-                        let payload_len = 1 + packet.len();
-                        let pad_len = (16 - (payload_len % 16)) % 16;
-
                         seq = seq.wrapping_add(1);
                         let mut nonce_bytes = [0u8; 12];
                         nonce_bytes[..4].copy_from_slice(&nonce_salt);
                         nonce_bytes[4..].copy_from_slice(&seq.to_be_bytes());
                         let nonce = Nonce::from_slice(&nonce_bytes);
 
-                        let total_len = 12 + 1 + packet.len() + pad_len + 16;
+                        let total_len = 12 + packet.len() + 16;
                         let mut final_pkt = BytesMut::with_capacity(total_len);
                         
                         final_pkt.put_slice(&nonce_bytes);
-                        final_pkt.put_u8(pad_len as u8);
                         final_pkt.put_slice(&packet);
-                        final_pkt.put_bytes(0, pad_len);
 
                         if let Ok(tag) = cipher_enc.encrypt_in_place_detached(nonce, &[], &mut final_pkt[12..]) {
                             final_pkt.put_slice(tag.as_slice());
@@ -921,12 +917,7 @@ async fn main() -> Result<()> {
                     let nonce = Nonce::from_slice(&buf[..12]);
                     if let Ok(plaintext) = cipher_dec.decrypt(nonce, &buf[12..]) {
                         if plaintext.is_empty() { continue; }
-                        let pad_len = plaintext[0] as usize;
-                        if plaintext.len() <= 1 + 4 + pad_len {
-                            let _ = tx_echo.send(Bytes::new()).await; 
-                            continue; 
-                        }
-                        let data = &plaintext[5..plaintext.len() - pad_len];
+                        let data = &plaintext;
 
                         {
                             let _ = tun_tx_tcp.send(Bytes::copy_from_slice(data)).await;
