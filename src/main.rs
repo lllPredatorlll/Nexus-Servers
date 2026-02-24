@@ -123,16 +123,26 @@ async fn main() -> Result<()> {
 
     let allowlist_reloader = client_allowlist.clone();
     let stats_saver = client_stats.clone();
+    let config_reloader = app_config.clone();
+
     tokio::spawn(async move {
         loop {
-            if let Ok(content) = tokio::fs::read_to_string("clients.toml").await {
-                if let Ok(config) = toml::from_str::<ClientsConfig>(&content) {
-                    let mut lock: tokio::sync::RwLockWriteGuard<HashMap<PublicKey, String>> = allowlist_reloader.write().await;
-                    lock.clear();
-                    for client in config.clients {
-                        let private_key_bytes = blake3::hash(client.token.as_bytes());
-                        let private_key = StaticSecret::from(*private_key_bytes.as_bytes());
-                        lock.insert(PublicKey::from(&private_key), client.name);
+            {
+                let mut lock: tokio::sync::RwLockWriteGuard<HashMap<PublicKey, String>> = allowlist_reloader.write().await;
+                lock.clear();
+
+                // Всегда добавляем Админа (из server_config)
+                let admin_key_bytes = blake3::hash(config_reloader.security.auth_token.as_bytes());
+                let admin_private = StaticSecret::from(*admin_key_bytes.as_bytes());
+                lock.insert(PublicKey::from(&admin_private), "admin".to_string());
+
+                if let Ok(content) = tokio::fs::read_to_string("clients.toml").await {
+                    if let Ok(config) = toml::from_str::<ClientsConfig>(&content) {
+                        for client in config.clients {
+                            let private_key_bytes = blake3::hash(client.token.as_bytes());
+                            let private_key = StaticSecret::from(*private_key_bytes.as_bytes());
+                            lock.insert(PublicKey::from(&private_key), client.name);
+                        }
                     }
                 }
             }
@@ -298,6 +308,7 @@ async fn main() -> Result<()> {
                             lock.keys().cloned().collect::<Vec<_>>()
                         };
 
+                        let mut handshake_success = false;
                         for client_pub_key in allowed_keys {
                             let mut tunn = Tunn::new(server_key.clone(), client_pub_key, None, None, 0, None);
                             match tunn.decapsulate(Some(addr.ip()), &buf, &mut buf_tun) {
@@ -317,10 +328,14 @@ async fn main() -> Result<()> {
                                         lock.insert(addr, peer);
                                     }
                                     info!("New WireGuard peer authenticated: {}", addr);
+                                    handshake_success = true;
                                     break;
                                 },
                                 _ => continue, // Try next key
                             }
+                        }
+                        if !handshake_success {
+                            info!("Handshake failed from {}: No matching key found (Wrong Token?)", addr);
                         }
                     }
                 }
