@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
     let socket = UdpSocket::from_std(socket.into())?;
     let socket = Arc::new(socket);
     
-    let tcp_listener = TcpListener::bind(&app_config.net.endpoint).await?;
+    let _tcp_listener = TcpListener::bind(&app_config.net.endpoint).await?;
     info!("Nexus Server listening on UDP & TCP {}", app_config.net.endpoint);
 
     let peers: Arc<RwLock<HashMap<SocketAddr, Arc<Peer>>>> = Arc::new(RwLock::new(HashMap::new()));
@@ -233,7 +233,7 @@ async fn main() -> Result<()> {
             let rx_pkt = rx_pkt.clone();
             let peers_recv = peers_recv.clone();
             let ip_map_recv = ip_map_recv.clone();
-            let socket_recv = socket_recv.clone();
+            let _socket_recv = socket_recv.clone();
             let socket_udp_send = socket_udp_send.clone();
             let tun_tx_udp = tun_tx_udp.clone();
             let udp_rx_metric = udp_rx_metric.clone();
@@ -255,8 +255,13 @@ async fn main() -> Result<()> {
                     if let Some(peer) = peer_opt {
                         // Existing peer
                         peer.last_seen.store(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(), Ordering::Relaxed);
-                        let mut tunn = peer.tunn.lock().unwrap();
-                        match tunn.decapsulate(Some(addr.ip()), &buf, &mut buf_tun) {
+                        
+                        let result = {
+                            let mut tunn = peer.tunn.lock().unwrap();
+                            tunn.decapsulate(Some(addr.ip()), &buf, &mut buf_tun)
+                        };
+
+                        match result {
                             TunnResult::WriteToNetwork(b) => {
                                 let _ = socket_udp_send.send_to(b, addr).await;
                                 udp_tx_metric.fetch_add(b.len() as u64, Ordering::Relaxed);
