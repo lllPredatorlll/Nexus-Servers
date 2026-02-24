@@ -12,6 +12,8 @@ use tun::Configuration;
 use serde::{Serialize, Deserialize};
 use socket2::{Socket, Domain, Type, Protocol};
 use bytes::{Bytes, BytesMut, BufMut};
+use boringtun::noise::{Tunn, TunnResult};
+use boringtun::x25519::{StaticSecret, PublicKey};
 
 mod config;
 
@@ -19,13 +21,9 @@ mod config;
 const VERSION: &str = "0.9.003 dev";
 
 struct Peer {
-    _tx: async_channel::Sender<Bytes>,
-    last_seen: Arc<AtomicU64>,
-    client_token: Option<String>,
-    ipv4: Ipv4Addr,
-    ipv6: Ipv6Addr,
-    _stats_tx: Option<Arc<AtomicU64>>,
-    stats_rx: Option<Arc<AtomicU64>>,
+    tunn: Mutex<Tunn>,
+    last_seen: AtomicU64,
+    endpoint: SocketAddr,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -111,13 +109,13 @@ async fn main() -> Result<()> {
     let tcp_listener = TcpListener::bind(&app_config.net.endpoint).await?;
     info!("Nexus Server listening on UDP & TCP {}", app_config.net.endpoint);
 
-    let peers: Arc<RwLock<HashMap<SocketAddr, Peer>>> = Arc::new(RwLock::new(HashMap::new()));
-    let ip_map: Arc<RwLock<HashMap<IpAddr, async_channel::Sender<Bytes>>>> = Arc::new(RwLock::new(HashMap::new()));
+    let peers: Arc<RwLock<HashMap<SocketAddr, Arc<Peer>>>> = Arc::new(RwLock::new(HashMap::new()));
+    let ip_map: Arc<RwLock<HashMap<IpAddr, Arc<Peer>>>> = Arc::new(RwLock::new(HashMap::new()));
     
-    let client_allowlist: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
+    // Map derived Public Key -> Client Name
+    let client_allowlist: Arc<RwLock<HashMap<PublicKey, String>>> = Arc::new(RwLock::new(HashMap::new()));
     let client_stats: Arc<RwLock<HashMap<String, (Arc<AtomicU64>, Arc<AtomicU64>)>>> = Arc::new(RwLock::new(HashMap::new()));
 
-    let next_ip = Arc::new(Mutex::new(2u8));
 
     let total_tx = Arc::new(AtomicU64::new(0));
     let total_rx = Arc::new(AtomicU64::new(0));
@@ -132,7 +130,9 @@ async fn main() -> Result<()> {
                     let mut lock = allowlist_reloader.write().await;
                     lock.clear();
                     for client in config.clients {
-                        lock.insert(client.token, client.name);
+                        let private_key_bytes = blake3::hash(client.token.as_bytes());
+                        let private_key = StaticSecret::from(*private_key_bytes.as_bytes());
+                        lock.insert(PublicKey::from(&private_key), client.name);
                     }
                 }
             }
@@ -181,7 +181,7 @@ async fn main() -> Result<()> {
                 let peers = peers_clean.read().await;
                 for (addr, peer) in peers.iter() {
                     if now - peer.last_seen.load(Ordering::Relaxed) > timeout {
-                        to_remove.push((*addr, peer.ipv4, peer.ipv6));
+                        to_remove.push((*addr, Ipv4Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED)); // IP cleanup handled by map scan or weak refs ideally
                     }
                 }
             }
@@ -190,10 +190,16 @@ async fn main() -> Result<()> {
                 let mut peers = peers_clean.write().await;
                 let mut ip_map = ip_map_clean.write().await;
                 
-                for (addr, ipv4, ipv6) in to_remove {
+                for (addr, _, _) in to_remove {
                     peers.remove(&addr);
-                    ip_map.remove(&IpAddr::V4(ipv4));
-                    ip_map.remove(&IpAddr::V6(ipv6));
+                    // Cleanup IP map (inefficient but safe)
+                    let mut ips_to_remove = Vec::new();
+                    for (ip, p) in ip_map.iter() {
+                        if p.endpoint == addr {
+                            ips_to_remove.push(*ip);
+                        }
+                    }
+                    for ip in ips_to_remove { ip_map.remove(&ip); }
                     info!("Клиент {} отключен по таймауту", addr);
                 }
             }
@@ -206,12 +212,15 @@ async fn main() -> Result<()> {
     let socket_udp_send = socket.clone();
     let tun_tx_udp = tun_tx.clone();
     let udp_config = app_config.clone();
-    let next_ip_udp = next_ip.clone();
     let udp_rx_metric = total_rx.clone();
     let udp_tx_metric = total_tx.clone();
     let udp_err_metric = total_err.clone();
     let udp_allowlist = client_allowlist.clone();
-    let udp_client_stats = client_stats.clone();
+
+    let server_private_key = {
+        let key_bytes = blake3::hash(udp_config.security.wg_private_key.as_bytes());
+        StaticSecret::from(*key_bytes.as_bytes())
+    };
 
     let num_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let (_udp_tx_dispatch, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -230,130 +239,83 @@ async fn main() -> Result<()> {
             let udp_rx_metric = udp_rx_metric.clone();
             let udp_tx_metric = udp_tx_metric.clone();
             let udp_allowlist = udp_allowlist.clone();
-            let udp_client_stats = udp_client_stats.clone();
-            let next_ip_udp = next_ip_udp.clone();
-            let auth_token = udp_config.security.auth_token.as_bytes().to_vec();
+            let server_key = server_private_key.clone();
+            let mut buf_tun = vec![0u8; 65535];
 
             tokio::spawn(async move {
                 while let Ok((buf, addr)) = rx_pkt.recv().await {
                     let len = buf.len();
                     udp_rx_metric.fetch_add(len as u64, Ordering::Relaxed);
-                    if len < 1 { continue; }
-
-                    let packet_type = buf[0];
-
-                    // Check if it's a known peer (Data packet)
-                    let (peer_tx, _peer_token, peer_stats_rx, peer_last_seen) = {
+                    
+                    let peer_opt = {
                         let lock = peers_recv.read().await;
-                        if let Some(p) = lock.get(&addr) {
-                            (Some(p._tx.clone()), p.client_token.clone(), p.stats_rx.clone(), Some(p.last_seen.clone()))
-                        } else {
-                            (None, None, None, None)
-                        }
+                        lock.get(&addr).cloned()
                     };
 
-                    // If peer exists and it's a data packet (IPv4 starts with 0x4, IPv6 with 0x6)
-                    // Handshake starts with 0x01.
-                    if let Some(_) = peer_tx {
-                        if packet_type != 0x01 {
-                            if let Some(rx) = &peer_stats_rx {
-                                rx.fetch_add(len as u64, Ordering::Relaxed);
-                            }
-                            if let Some(ls) = peer_last_seen {
-                                ls.store(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(), Ordering::Relaxed);
-                            }
-                            let data_bytes = Bytes::copy_from_slice(&buf);
-                            let _ = tun_tx_udp.send(data_bytes).await;
-                            continue;
-                        }
-                    }
-
-                    // Handshake: [0x01 | token_len | token]
-                    if packet_type == 0x01 {
-                        if len < 2 { continue; }
-                        let token_len = buf[1] as usize;
-                        if len < 2 + token_len { continue; }
-                        
-                        let token_sent = &buf[2..2+token_len];
-                        let mut client_token_found = None;
-
-                        if token_sent != auth_token.as_slice() {
-                            let lock = udp_allowlist.read().await;
-                            if let Some(token_str) = std::str::from_utf8(token_sent).ok() {
-                                if lock.contains_key(token_str) {
-                                    client_token_found = Some(token_str.to_string());
-                                }
-                            }
-                            if client_token_found.is_none() {
-                                warn!("Auth failed (UDP): Invalid token from {}", addr);
-                                continue;
-                            }
-                        }
-
-                        let client_ip_octet = {
-                            let mut ip = next_ip_udp.lock().unwrap();
-                            let val = *ip;
-                            *ip = if val >= 253 { 2 } else { val + 1 };
-                            val
-                        };
-                        let client_ip = Ipv4Addr::new(10, 0, 0, client_ip_octet);
-                        let client_ip_v6 = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, client_ip_octet as u16);
-
-                        let (peer_stats_tx, peer_stats_rx) = if let Some(token) = &client_token_found {
-                            let mut lock = udp_client_stats.write().await;
-                            let entry = lock.entry(token.clone()).or_insert_with(|| (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))));
-                            (Some(entry.0.clone()), Some(entry.1.clone()))
-                        } else {
-                            (None, None)
-                        };
-
-                        let (tx, rx) = async_channel::bounded::<Bytes>(16384);
-                        let socket_sender = socket_udp_send.clone();
-                        let tx_metric = udp_tx_metric.clone();
-                        let tx_stats_inner = peer_stats_tx.clone();
-                        
-                        tokio::spawn(async move {
-                            let rx = rx;
-                            while let Ok(packet) = rx.recv().await {
-                                if socket_sender.send_to(&packet, addr).await.is_ok() {
-                                    tx_metric.fetch_add(packet.len() as u64, Ordering::Relaxed);
-                                    if let Some(tx) = &tx_stats_inner {
-                                        tx.fetch_add(packet.len() as u64, Ordering::Relaxed);
+                    if let Some(peer) = peer_opt {
+                        // Existing peer
+                        peer.last_seen.store(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(), Ordering::Relaxed);
+                        let mut tunn = peer.tunn.lock().unwrap();
+                        match tunn.decapsulate(Some(addr.ip()), &buf, &mut buf_tun) {
+                            TunnResult::WriteToNetwork(b) => {
+                                let _ = socket_udp_send.send_to(b, addr).await;
+                                udp_tx_metric.fetch_add(b.len() as u64, Ordering::Relaxed);
+                            },
+                            TunnResult::WriteToTunnelV4(b, _) | TunnResult::WriteToTunnelV6(b, _) => {
+                                // Learn IP mapping
+                                if b.len() > 20 {
+                                    let src_ip = match b[0] >> 4 {
+                                        4 => IpAddr::V4(Ipv4Addr::new(b[12], b[13], b[14], b[15])),
+                                        6 => {
+                                            let octets: [u8; 16] = b[8..24].try_into().unwrap_or([0; 16]);
+                                            IpAddr::V6(Ipv6Addr::from(octets))
+                                        },
+                                        _ => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                                    };
+                                    if !src_ip.is_unspecified() {
+                                        let mut map = ip_map_recv.write().await;
+                                        if !map.contains_key(&src_ip) {
+                                            map.insert(src_ip, peer.clone());
+                                            info!("Registered IP {} for peer {}", src_ip, addr);
+                                        }
                                     }
                                 }
+                                let data = Bytes::copy_from_slice(b);
+                                let _ = tun_tx_udp.send(data).await;
+                            },
+                            _ => {}
+                        }
+                    } else if buf.len() >= 148 && buf[0] == 1 {
+                        // Handshake Initiation from unknown peer
+                        // Try to identify by iterating allowed keys (inefficient but works for small scale)
+                        let allowed_keys = {
+                            let lock = udp_allowlist.read().await;
+                            lock.keys().cloned().collect::<Vec<_>>()
+                        };
+
+                        for client_pub_key in allowed_keys {
+                            let mut tunn = Tunn::new(server_key.clone(), client_pub_key, None, None, 0, None).unwrap();
+                            match tunn.decapsulate(Some(addr.ip()), &buf, &mut buf_tun) {
+                                TunnResult::WriteToNetwork(b) => {
+                                    // Handshake valid!
+                                    let _ = socket_udp_send.send_to(b, addr).await;
+                                    udp_tx_metric.fetch_add(b.len() as u64, Ordering::Relaxed);
+                                    
+                                    let peer = Arc::new(Peer {
+                                        tunn: Mutex::new(tunn),
+                                        last_seen: AtomicU64::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
+                                        endpoint: addr,
+                                    });
+                                    
+                                    {
+                                        let mut lock = peers_recv.write().await;
+                                        lock.insert(addr, peer);
+                                    }
+                                    info!("New WireGuard peer authenticated: {}", addr);
+                                    break;
+                                },
+                                _ => continue, // Try next key
                             }
-                        });
-
-                        let last_seen = Arc::new(AtomicU64::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()));
-
-                        {
-                            let mut lock = peers_recv.write().await;
-                            lock.insert(addr, Peer { 
-                                _tx: tx.clone(), 
-                                last_seen, 
-                                client_token: client_token_found.clone(),
-                                ipv4: client_ip,
-                                ipv6: client_ip_v6,
-                                _stats_tx: peer_stats_tx,
-                                stats_rx: peer_stats_rx,
-                            });
-                        }
-
-                        {
-                            let mut lock = ip_map_recv.write().await;
-                            lock.insert(IpAddr::V4(client_ip), tx.clone());
-                            lock.insert(IpAddr::V6(client_ip_v6), tx.clone());
-                        }
-                        println!("Новый клиент: {} -> {}", addr, client_ip);
-
-                        // Response: [0x02 | ipv4 | ipv6]
-                        let mut response = Vec::with_capacity(1 + 4 + 16);
-                        response.push(0x02);
-                        response.extend_from_slice(&client_ip.octets());
-                        response.extend_from_slice(&client_ip_v6.octets());
-
-                        if socket_recv.send_to(&response, addr).await.is_ok() {
-                            udp_tx_metric.fetch_add(response.len() as u64, Ordering::Relaxed);
                         }
                     }
                 }
@@ -375,163 +337,14 @@ async fn main() -> Result<()> {
         }
     });
 
-    let ip_map_tcp = ip_map.clone();
-    let tcp_config = app_config.clone();
-    let next_ip_tcp = next_ip.clone();
-    let tcp_rx_metric = total_rx.clone();
-    let tcp_tx_metric = total_tx.clone();
-    let tcp_err_metric = total_err.clone();
-    let tcp_allowlist = client_allowlist.clone();
-    let tcp_client_stats = client_stats.clone();
+    // TCP Support for WireGuard over TCP (Stream)
+    // This requires framing. BoringTun doesn't handle TCP framing natively.
+    // For now, we disable TCP or need to implement a wrapper that feeds Tunn.
+    // Given the complexity, we focus on UDP first as per standard WG.
+    // If TCP is required, it needs a similar logic: Read frame -> Tunn.decapsulate -> Write frame.
 
-        tokio::spawn(async move {
-        let auth_token = tcp_config.security.auth_token.as_bytes().to_vec();
-        
-        loop {
-            let (stream, addr) = match tcp_listener.accept().await {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            stream.set_nodelay(true).ok();
-            debug!("TCP подключение: {}", addr);
-            
-            let tun_tx_tcp = tun_tx.clone();
-            let ip_map = ip_map_tcp.clone();
-            let auth_token = auth_token.clone();
-            let next_ip = next_ip_tcp.clone();
-            let rx_m = tcp_rx_metric.clone();
-            let tx_m = tcp_tx_metric.clone();
-            let _err_m = tcp_err_metric.clone();
-            let allowlist = tcp_allowlist.clone();
-            let client_stats = tcp_client_stats.clone();
-
-            tokio::spawn(async move {
-                let mut stream = stream;
-                // Read handshake frame: [len(2) | 0x01 | token_len | token]
-                let mut len_buf = [0u8; 2];
-                if stream.read_exact(&mut len_buf).await.is_err() { return; }
-                let len = u16::from_be_bytes(len_buf) as usize;
-                
-                let mut buf = vec![0u8; len];
-                if stream.read_exact(&mut buf).await.is_err() { return; }
-                rx_m.fetch_add((2 + len) as u64, Ordering::Relaxed);
-
-                if len < 2 || buf[0] != 0x01 { return; }
-                let token_len = buf[1] as usize;
-                if len < 2 + token_len { return; }
-                
-                let token_sent = &buf[2..2+token_len];
-                let mut client_token_found = None;
-
-                if token_sent != auth_token.as_slice() {
-                    let lock = allowlist.read().await;
-                    if let Some(token_str) = std::str::from_utf8(token_sent).ok() {
-                        if lock.contains_key(token_str) {
-                            client_token_found = Some(token_str.to_string());
-                        }
-                    }
-                    if client_token_found.is_none() {
-                        warn!("Auth failed (TCP): Invalid token from {}", addr);
-                        return;
-                    }
-                }
-
-                let client_ip_octet = {
-                    let mut ip = next_ip.lock().unwrap();
-                    let val = *ip;
-                    *ip = if val >= 253 { 2 } else { val + 1 };
-                    val
-                };
-                let client_ip = Ipv4Addr::new(10, 0, 0, client_ip_octet);
-                let client_ip_v6 = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, client_ip_octet as u16);
-
-                // Response: [len(2) | 0x02 | ipv4 | ipv6]
-                let mut response = Vec::with_capacity(1 + 4 + 16);
-                response.push(0x02);
-                response.extend_from_slice(&client_ip.octets());
-                response.extend_from_slice(&client_ip_v6.octets());
-                
-                let mut combined = Vec::with_capacity(2 + response.len());
-                combined.extend_from_slice(&(response.len() as u16).to_be_bytes());
-                combined.extend_from_slice(&response);
-                if stream.write_all(&combined).await.is_err() { return; }
-                tx_m.fetch_add(combined.len() as u64, Ordering::Relaxed);
-
-                if let Some(token) = &client_token_found {
-                    let mut lock = client_stats.write().await;
-                    if !lock.contains_key(token) {
-                        lock.insert(token.clone(), (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))));
-                    }
-                }
-
-                let (peer_stats_tx, peer_stats_rx) = if let Some(token) = &client_token_found {
-                    let lock = client_stats.read().await;
-                    if let Some((tx, rx)) = lock.get(token) {
-                        (Some(tx.clone()), Some(rx.clone()))
-                    } else { (None, None) }
-                } else { (None, None) };
-
-                let (tx, rx) = async_channel::bounded::<Bytes>(8192);
-                {
-                    let mut lock = ip_map.write().await;
-                    lock.insert(IpAddr::V4(client_ip), tx.clone());
-                    lock.insert(IpAddr::V6(client_ip_v6), tx.clone());
-                }
-                info!("TCP клиент подключен: {} -> {}", addr, client_ip);
-
-                let (mut read_half, write_half) = stream.into_split();
-                let tx_m_inner = tx_m.clone();
-                let rx_m_inner = rx_m.clone();
-                let tx_stats_inner = peer_stats_tx.clone();
-                let rx_stats_inner = peer_stats_rx.clone();
-
-                let t_write = tokio::spawn(async move {
-                    let rx = rx;
-                    let mut write_half = write_half;
-                    let mut combined_buf = BytesMut::with_capacity(2048);
-                    
-                    while let Ok(packet) = rx.recv().await {
-                        combined_buf.clear();
-                        combined_buf.put_u16(packet.len() as u16);
-                        combined_buf.put_slice(&packet);
-
-                        if write_half.write_all(&combined_buf).await.is_err() { break; }
-                        tx_m_inner.fetch_add((2 + packet.len()) as u64, Ordering::Relaxed);
-                        if let Some(tx) = &tx_stats_inner {
-                            tx.fetch_add((2 + packet.len()) as u64, Ordering::Relaxed);
-                        }
-                    }
-                });
-
-                let mut buf = BytesMut::with_capacity(65536);
-                loop {
-                    let mut hdr = [0u8; 5];
-                    if read_half.read_exact(&mut hdr[..2]).await.is_err() { break; }
-                    let len = u16::from_be_bytes([hdr[0], hdr[1]]) as usize;
-
-                    if buf.capacity() < len { buf.reserve(len); }
-                    buf.resize(len, 0);
-                    if read_half.read_exact(&mut buf).await.is_err() { break; }
-
-                    rx_m_inner.fetch_add((2 + len) as u64, Ordering::Relaxed);
-                    if let Some(rx) = &rx_stats_inner {
-                        rx.fetch_add((2 + len) as u64, Ordering::Relaxed);
-                    }
-
-                    let data = Bytes::copy_from_slice(&buf);
-                    let _ = tun_tx_tcp.send(data).await;
-                }
-
-                t_write.abort();
-                {
-                    let mut lock = ip_map.write().await;
-                    lock.remove(&IpAddr::V4(client_ip));
-                    lock.remove(&IpAddr::V6(client_ip_v6));
-                }
-                info!("TCP клиент отключен: {}", client_ip);
-            });
-        }
-    });
+    // TUN -> Network
+    let mut buf_out = vec![0u8; 65535];
 
     let mut buf = BytesMut::with_capacity(65536);
     loop {
@@ -555,13 +368,20 @@ async fn main() -> Result<()> {
             _ => continue,
         };
 
-        let target_tx = {
+        let peer_opt = {
             let lock = ip_map.read().await;
             lock.get(&dst_ip).cloned()
         };
 
-        if let Some(tx) = target_tx {
-            let _ = tx.send(packet.freeze()).await;
+        if let Some(peer) = peer_opt {
+            let mut tunn = peer.tunn.lock().unwrap();
+            match tunn.encapsulate(&packet, &mut buf_out) {
+                TunnResult::WriteToNetwork(b) => {
+                    let _ = socket.send_to(b, peer.endpoint).await;
+                    total_tx.fetch_add(b.len() as u64, Ordering::Relaxed);
+                },
+                _ => {}
+            }
         }
     }
 

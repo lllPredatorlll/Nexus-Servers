@@ -77,12 +77,15 @@ impl Default for NetConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SecurityConfig {
     pub auth_token: String,
+    #[serde(default)]
+    pub wg_private_key: String,
 }
 
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             auth_token: "".to_string(),
+            wg_private_key: "".to_string(),
         }
     }
 }
