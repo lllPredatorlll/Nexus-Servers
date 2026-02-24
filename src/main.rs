@@ -6,12 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UdpSocket, TcpListener};
 use tokio::sync::RwLock;
-use log::{info, error, warn, debug};
+use log::{info, error};
 use flexi_logger::{Logger, FileSpec, Criterion, Naming, Cleanup, Duplicate};
 use tun::Configuration;
 use serde::{Serialize, Deserialize};
 use socket2::{Socket, Domain, Type, Protocol};
-use bytes::{Bytes, BytesMut, BufMut};
+use bytes::{Bytes, BytesMut};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{StaticSecret, PublicKey};
 
@@ -127,7 +127,7 @@ async fn main() -> Result<()> {
         loop {
             if let Ok(content) = tokio::fs::read_to_string("clients.toml").await {
                 if let Ok(config) = toml::from_str::<ClientsConfig>(&content) {
-                    let mut lock = allowlist_reloader.write().await;
+                    let mut lock: tokio::sync::RwLockWriteGuard<HashMap<PublicKey, String>> = allowlist_reloader.write().await;
                     lock.clear();
                     for client in config.clients {
                         let private_key_bytes = blake3::hash(client.token.as_bytes());
@@ -289,7 +289,7 @@ async fn main() -> Result<()> {
                         // Handshake Initiation from unknown peer
                         // Try to identify by iterating allowed keys (inefficient but works for small scale)
                         let allowed_keys = {
-                            let lock = udp_allowlist.read().await;
+                            let lock: tokio::sync::RwLockReadGuard<HashMap<PublicKey, String>> = udp_allowlist.read().await;
                             lock.keys().cloned().collect::<Vec<_>>()
                         };
 
