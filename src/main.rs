@@ -294,7 +294,7 @@ async fn main() -> Result<()> {
                         };
 
                         for client_pub_key in allowed_keys {
-                            let mut tunn = Tunn::new(server_key.clone(), client_pub_key, None, None, 0, None).unwrap();
+                            let mut tunn = Tunn::new(server_key.clone(), client_pub_key, None, None, 0, None);
                             match tunn.decapsulate(Some(addr.ip()), &buf, &mut buf_tun) {
                                 TunnResult::WriteToNetwork(b) => {
                                     // Handshake valid!
